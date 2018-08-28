@@ -29,7 +29,7 @@ def _fit_and_score_keras(estimator, X, y, scorer, train, test, verbose,
                    parameters, fit_params, return_train_score=False,
                    return_parameters=False, return_n_test_samples=False,
                    return_times=False, error_score='raise',session=None):
-    """Fit estimator and compute scores for a given dataset split.
+    """Fit estimator and compute scores for a given dataset split for KerasClassifier and KerasRegressor.
 
     Parameters
     ----------
@@ -43,8 +43,14 @@ def _fit_and_score_keras(estimator, X, y, scorer, train, test, verbose,
         The target variable to try to predict in the case of
         supervised learning.
 
-    scorer : callable
-        A scorer callable object / function with signature
+    scorer : A single callable or dict mapping scorer name to the callable
+        If it is a single callable, the return value for ``train_scores`` and
+        ``test_scores`` is a single float.
+
+        For a dict, it should be one mapping the scorer name to the scorer
+        callable object / function.
+
+        The callable object / fn should have signature
         ``scorer(estimator, X, y)``.
 
     train : array-like, shape (n_train_samples,)
@@ -74,13 +80,27 @@ def _fit_and_score_keras(estimator, X, y, scorer, train, test, verbose,
     return_parameters : boolean, optional, default: False
         Return parameters that has been used for the estimator.
 
+    return_n_test_samples : boolean, optional, default: False
+        Whether to return the ``n_test_samples``
+
+    return_times : boolean, optional, default: False
+        Whether to return the fit/score times.
+
+    session : Keras backend with a tensorflow session attached
+        The keras backend session for applying K.clear_session()
+        after the classifier or regressor has been train and scored
+        given the split. This is mainly required to avoid posible
+        Out Of Memory errors with tensorflow not deallocating the
+        GPU memory after each iteration of the Cross Validation.
+
     Returns
     -------
-    train_score : float, optional
-        Score on training set, returned only if `return_train_score` is `True`.
+    train_scores : dict of scorer name -> float, optional
+        Score on training set (for all the scorers),
+        returned only if `return_train_score` is `True`.
 
-    test_score : float
-        Score on test set.
+    test_scores : dict of scorer name -> float, optional
+        Score on testing set (for all the scorers).
 
     n_test_samples : int
         Number of test samples.
@@ -107,6 +127,8 @@ def _fit_and_score_keras(estimator, X, y, scorer, train, test, verbose,
     fit_params = dict([(k, _index_param_value(X, v, train))
                       for k, v in fit_params.items()])
 
+    test_scores = {}
+    train_scores = {}
     if parameters is not None:
         estimator.set_params(**parameters)
 
@@ -114,6 +136,9 @@ def _fit_and_score_keras(estimator, X, y, scorer, train, test, verbose,
 
     X_train, y_train = _safe_split(estimator, X, y, train)
     X_test, y_test = _safe_split(estimator, X, y, test, train)
+
+    is_multimetric = not callable(scorer)
+    n_scorers = len(scorer.keys()) if is_multimetric else 1
 
     try:
         if y_train is None:
@@ -128,9 +153,16 @@ def _fit_and_score_keras(estimator, X, y, scorer, train, test, verbose,
         if error_score == 'raise':
             raise
         elif isinstance(error_score, numbers.Number):
-            test_score = error_score
-            if return_train_score:
-                train_score = error_score
+            if is_multimetric:
+                test_scores = dict(zip(scorer.keys(),
+                                   [error_score, ] * n_scorers))
+                if return_train_score:
+                    train_scores = dict(zip(scorer.keys(),
+                                        [error_score, ] * n_scorers))
+            else:
+                test_scores = error_score
+                if return_train_score:
+                    train_scores = error_score
             warnings.warn("Classifier fit failed. The score on this train-test"
                           " partition for these parameters will be set to %f. "
                           "Details: \n%r" % (error_score, e), FitFailedWarning)
@@ -141,19 +173,25 @@ def _fit_and_score_keras(estimator, X, y, scorer, train, test, verbose,
 
     else:
         fit_time = time.time() - start_time
-        test_score = _score(estimator, X_test, y_test, scorer)
+        # _score will return dict if is_multimetric is True
+        test_scores = _score(estimator, X_test, y_test, scorer, is_multimetric)
         score_time = time.time() - start_time - fit_time
         if return_train_score:
-            train_score = _score(estimator, X_train, y_train, scorer)
+            train_scores = _score(estimator, X_train, y_train, scorer,
+                                  is_multimetric)
 
     if verbose > 2:
-        msg += ", score=%f" % test_score
+        if is_multimetric:
+            for scorer_name, score in test_scores.items():
+                msg += ", %s=%s" % (scorer_name, score)
+        else:
+            msg += ", score=%s" % test_scores
     if verbose > 1:
         total_time = score_time + fit_time
         end_msg = "%s, total=%s" % (msg, logger.short_format_time(total_time))
         print("[CV] %s %s" % ((64 - len(end_msg)) * '.', end_msg))
 
-    ret = [train_score, test_score] if return_train_score else [test_score]
+    ret = [train_scores, test_scores] if return_train_score else [test_scores]
 
     if return_n_test_samples:
         ret.append(_num_samples(X_test))
@@ -161,10 +199,13 @@ def _fit_and_score_keras(estimator, X, y, scorer, train, test, verbose,
         ret.extend([fit_time, score_time])
     if return_parameters:
         ret.append(parameters)
+    # The estimator is erased
     del estimator
+    # We assign the keras backend
     K = session
-    #Clean the session
+    # Clean the session
     K.clear_session()
+    # The garbage collector is called in order to ensure that the estimator is erased from memory
     for i in range(15): gc.collect()
     return ret
 
@@ -238,7 +279,8 @@ class kerasGridSearchCV(GridSearchCV):
 
         base_estimator = clone(self.estimator)
         pre_dispatch = self.pre_dispatch
-
+        # One of the main changes is instead of using the _fit_and_score from sklearn.model_selection._validation
+        # We use a modified one (_fit_and_score_keras) that clears the session after each iteration
         out = Parallel(
             n_jobs=self.n_jobs, verbose=self.verbose,
             pre_dispatch=pre_dispatch
@@ -249,7 +291,7 @@ class kerasGridSearchCV(GridSearchCV):
                                   return_n_test_samples=True,
                                   return_times=True, return_parameters=False,
                                   error_score=self.error_score,
-                                  session=session)
+                                  session=session) # Passing the session (Keras backend) argument
           for parameters, (train, test) in product(candidate_params,
                                                    cv.split(X, y, groups)))
 
@@ -349,29 +391,3 @@ class kerasGridSearchCV(GridSearchCV):
         self.n_splits_ = n_splits
 
         return self
-
-    @property
-    def grid_scores_(self):
-        check_is_fitted(self, 'cv_results_')
-        if self.multimetric_:
-            raise AttributeError("grid_scores_ attribute is not available for"
-                                 " multi-metric evaluation.")
-        warnings.warn(
-            "The grid_scores_ attribute was deprecated in version 0.18"
-            " in favor of the more elaborate cv_results_ attribute."
-            " The grid_scores_ attribute will not be available from 0.20",
-            DeprecationWarning)
-
-        grid_scores = list()
-
-        for i, (params, mean, std) in enumerate(zip(
-                self.cv_results_['params'],
-                self.cv_results_['mean_test_score'],
-                self.cv_results_['std_test_score'])):
-            scores = np.array(list(self.cv_results_['split%d_test_score'
-                                                    % s][i]
-                                   for s in range(self.n_splits_)),
-                              dtype=np.float64)
-            grid_scores.append(_CVScoreTuple(params, mean, scores))
-
-        return grid_scores
